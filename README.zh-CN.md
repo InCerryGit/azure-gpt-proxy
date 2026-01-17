@@ -43,7 +43,7 @@ copy .env.sample .env
 ### 1. 构建镜像
 
 ```bash
-docker build -t claude-azure-gpt-proxy .
+docker build -t claude-azure-gpt-proxy:latest .
 ```
 
 ### 2. 准备环境变量
@@ -57,6 +57,10 @@ copy .env.sample .env
 ### 3. 运行容器
 
 ```bash
+# 删除同名旧容器（如果存在）
+docker rm -f claude-azure-gpt-proxy
+
+# 启动
 docker run -d --name claude-azure-gpt-proxy --env-file .env -p 8088:8080 claude-azure-gpt-proxy:latest
 ```
 

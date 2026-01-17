@@ -43,7 +43,7 @@ The listening address is determined by `ASPNETCORE_URLS`. The startup log prints
 ### 1. Build image
 
 ```bash
-docker build -t claude-azure-gpt-proxy .
+docker build -t claude-azure-gpt-proxy:latest .
 ```
 
 ### 2. Prepare environment variables
@@ -57,6 +57,10 @@ copy .env.sample .env
 ### 3. Run container
 
 ```bash
+# remove existing container with the same name (if any)
+docker rm -f claude-azure-gpt-proxy
+
+# run
 docker run -d --name claude-azure-gpt-proxy --env-file .env -p 8088:8080 claude-azure-gpt-proxy:latest
 ```
 
