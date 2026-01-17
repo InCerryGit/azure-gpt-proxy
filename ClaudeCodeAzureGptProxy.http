@@ -1,0 +1,6 @@
+@ClaudeCodeAzureGptProxy_HostAddress = http://localhost:5196
+
+GET {{ClaudeCodeAzureGptProxy_HostAddress}}/weatherforecast/
+Accept: application/json
+
+###
