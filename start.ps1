@@ -11,4 +11,4 @@ if (Test-Path $envFile) {
     }
 }
 
-dotnet run --project "$PSScriptRoot\ClaudeCodeAzureGptProxy.csproj"
+dotnet run --project "$PSScriptRoot\ClaudeAzureGptProxy.csproj"

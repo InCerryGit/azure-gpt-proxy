@@ -1,4 +1,5 @@
 using System.Linq;
+using System.Text.Encodings.Web;
 using System.Text.Json;
 using ClaudeAzureGptProxy.Models;
 using Microsoft.Extensions.Logging;
@@ -16,12 +17,70 @@ public static class SseStreaming
         public int InputTokens { get; set; }
         public int OutputTokens { get; set; }
         public string? StopReason { get; set; }
+
+        public MessagesResponse? AggregatedResponse { get; set; }
     }
+
+    private static readonly JsonSerializerOptions JsonOptions = new()
+    {
+        Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping
+    };
 
     private static string EmitEvent(string eventType, object payload)
     {
-        return $"event: {eventType}\ndata: {JsonSerializer.Serialize(payload)}\n\n";
+        return $"event: {eventType}\ndata: {JsonSerializer.Serialize(payload, JsonOptions)}\n\n";
     }
+
+    private static MessagesResponse BuildAggregatedResponse(
+        string messageId,
+        string responseModel,
+        string accumulatedText,
+        Dictionary<string, int> toolKeyToAnthropicIndex,
+        int inputTokens,
+        int outputTokens,
+        string? stopReason)
+    {
+        var content = new List<Dictionary<string, object?>>();
+
+        // text block index=0 is always present in this implementation
+        content.Add(new Dictionary<string, object?>
+        {
+            ["type"] = "text",
+            ["text"] = accumulatedText
+        });
+
+        // We can determine how many tool blocks were started by taking the max mapped index.
+        // Tool content blocks are 1..N.
+        var maxToolIndex = toolKeyToAnthropicIndex.Count == 0 ? 0 : toolKeyToAnthropicIndex.Values.Max();
+        for (var i = 1; i <= maxToolIndex; i++)
+        {
+            content.Add(new Dictionary<string, object?>
+            {
+                ["type"] = "tool_use",
+                ["id"] = string.Empty,
+                ["name"] = string.Empty,
+                ["input"] = new Dictionary<string, object?>()
+            });
+        }
+
+        return new MessagesResponse
+        {
+            Id = messageId,
+            Model = responseModel,
+            Role = "assistant",
+            Content = content,
+            StopReason = stopReason,
+            StopSequence = null,
+            Usage = new Usage
+            {
+                InputTokens = inputTokens,
+                OutputTokens = outputTokens,
+                CacheCreationInputTokens = 0,
+                CacheReadInputTokens = 0
+            }
+        };
+    }
+
 
     private static string EmitMessageStart(string messageId, string responseModel, int inputTokens, int outputTokens)
     {
@@ -147,6 +206,29 @@ public static class SseStreaming
 
             stats.EventCount += 6;
             stats.StopReason = "end_turn";
+            stats.AggregatedResponse = new MessagesResponse
+            {
+                Id = messageId,
+                Model = responseModel,
+                Role = "assistant",
+                Content = new List<Dictionary<string, object?>>
+                {
+                    new()
+                    {
+                        ["type"] = "text",
+                        ["text"] = string.Empty
+                    }
+                },
+                StopReason = "end_turn",
+                StopSequence = null,
+                Usage = new Usage
+                {
+                    InputTokens = 0,
+                    OutputTokens = 0,
+                    CacheCreationInputTokens = 0,
+                    CacheReadInputTokens = 0
+                }
+            };
             logger.LogInformation(
                 "Streaming ended without chunks messageId={MessageId} chunks=0 events={EventCount}",
                 messageId,
@@ -172,6 +254,8 @@ public static class SseStreaming
             try
             {
                 events = ProcessStreamChunk(
+                    messageId,
+                    responseModel,
                     chunk,
                     ref toolIndex,
                     ref accumulatedText,
@@ -220,6 +304,8 @@ public static class SseStreaming
             try
             {
                 events = ProcessStreamChunk(
+                    messageId,
+                    responseModel,
                     chunk,
                     ref toolIndex,
                     ref accumulatedText,
@@ -276,6 +362,7 @@ public static class SseStreaming
             stats.InputTokens = inputTokens;
             stats.OutputTokens = outputTokens;
             stats.StopReason = "end_turn";
+            stats.AggregatedResponse = BuildAggregatedResponse(messageId, responseModel, accumulatedText, toolKeyToAnthropicIndex, inputTokens, outputTokens, stats.StopReason);
 
             logger.LogInformation(
                 "Streaming ended without finish_reason messageId={MessageId} inputTokens={InputTokens} outputTokens={OutputTokens} chunks={ChunkCount} events={EventCount}",
@@ -500,6 +587,8 @@ public static class SseStreaming
     }
 
     private static List<string> ProcessStreamChunk(
+        string messageId,
+        string responseModel,
         Dictionary<string, object?> chunk,
         ref int? toolIndex,
         ref string accumulatedText,
@@ -578,6 +667,7 @@ public static class SseStreaming
 
             var stopReason = MapStopReason(finishReason);
             stats.StopReason = stopReason;
+            stats.AggregatedResponse = BuildAggregatedResponse(messageId, responseModel, accumulatedText, toolKeyToAnthropicIndex, inputTokens, outputTokens, stopReason);
             events.Add(EmitMessageDelta(stopReason, outputTokens));
             events.Add(EmitMessageStop());
             events.Add("data: [DONE]\n\n");

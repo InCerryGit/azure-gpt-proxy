@@ -19,21 +19,25 @@ public sealed class AzureOpenAiProxy
     private readonly ILogger<AzureOpenAiProxy> _logger;
     private readonly NormalizedAzureOpenAiOptions _azureOptions;
     private readonly AzureOpenAiOptions _rawOptions;
+    private readonly ResponseLog _responseLog;
 
     public AzureOpenAiProxy(
         AzureOpenAiClientFactory clientFactory,
         ILogger<AzureOpenAiProxy> logger,
         NormalizedAzureOpenAiOptions azureOptions,
-        IOptions<AzureOpenAiOptions> rawOptions)
+        IOptions<AzureOpenAiOptions> rawOptions,
+        ResponseLog responseLog)
     {
         _clientFactory = clientFactory;
         _logger = logger;
         _azureOptions = azureOptions;
         _rawOptions = rawOptions.Value;
+        _responseLog = responseLog;
     }
 
     public async Task<object> SendAsync(MessagesRequest request, CancellationToken cancellationToken)
     {
+        _responseLog.LogRequest(request, isStream: false);
         var stopwatch = Stopwatch.StartNew();
         var payload = AnthropicConversion.ConvertAnthropicToAzure(request, _logger, _azureOptions);
         request.ResolvedAzureModel ??= payload["model"]?.ToString();
@@ -56,6 +60,7 @@ public sealed class AzureOpenAiProxy
         if (isResponses)
         {
             var responsePayload = await SendResponsesAsync(payload, cancellationToken);
+            _responseLog.LogAzureResponse(responsePayload);
             _logger.LogInformation("Azure responses completed elapsedMs={ElapsedMs}", stopwatch.ElapsedMilliseconds);
             return responsePayload;
         }
@@ -84,13 +89,16 @@ public sealed class AzureOpenAiProxy
             response.Value.Usage.OutputTokenCount,
             stopwatch.ElapsedMilliseconds);
 
-        return ConvertChatResponse(response.Value);
+        var converted = ConvertChatResponse(response.Value);
+        _responseLog.LogAzureResponse(converted);
+        return converted;
     }
 
     public async IAsyncEnumerable<Dictionary<string, object?>> StreamAsync(
         MessagesRequest request,
         [EnumeratorCancellation] CancellationToken cancellationToken)
     {
+        _responseLog.LogRequest(request, isStream: true);
         var stopwatch = Stopwatch.StartNew();
         var payload = AnthropicConversion.ConvertAnthropicToAzure(request, _logger, _azureOptions);
         request.ResolvedAzureModel ??= payload["model"]?.ToString();
@@ -116,6 +124,7 @@ public sealed class AzureOpenAiProxy
             _logger.LogInformation("Azure responses stream synth completed elapsedMs={ElapsedMs}", stopwatch.ElapsedMilliseconds);
             var synthesized = AnthropicConversion.ConvertAzureToAnthropic(responsePayload, request, _logger);
             var chunk = BuildStreamChunkFromAnthropic(synthesized);
+            _responseLog.LogAzureStreamChunk(0, chunk);
             yield return chunk;
             yield break;
         }
@@ -135,6 +144,7 @@ public sealed class AzureOpenAiProxy
             options.Tools.Count);
 
         var chatClient = client.GetChatClient(deployment);
+        var chunkIndex = 0;
         await foreach (var update in chatClient.CompleteChatStreamingAsync(messages, options, cancellationToken))
         {
             var delta = new Dictionary<string, object?>
@@ -168,6 +178,8 @@ public sealed class AzureOpenAiProxy
                 };
             }
 
+            _responseLog.LogAzureStreamChunk(chunkIndex, chunk);
+            chunkIndex++;
             yield return chunk;
         }
 

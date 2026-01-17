@@ -13,12 +13,16 @@ builder.Services.AddAzureOpenAiConfig(builder.Configuration);
 builder.Services.AddSingleton<AzureOpenAiClientFactory>();
 builder.Services.AddSingleton<AzureOpenAiProxy>();
 builder.Services.AddSingleton<TokenCounter>();
+builder.Services.AddSingleton<ResponseLog>();
 
 var logLevelSection = builder.Configuration.GetSection("Logging:LogLevel");
 var defaultLevel = MapLogLevel(logLevelSection["Default"]) ?? LogEventLevel.Information;
-var microsoftLevel = MapLogLevel(logLevelSection["Microsoft"]) ?? LogEventLevel.Warning;
-var aspNetCoreLevel = MapLogLevel(logLevelSection["Microsoft.AspNetCore"]) ?? microsoftLevel;
-var systemLevel = MapLogLevel(logLevelSection["System"]) ?? LogEventLevel.Warning;
+
+var overrideLevels = logLevelSection.GetChildren()
+    .Select(x => (Key: x.Key, Level: MapLogLevel(x.Value)))
+    .Where(x => !string.IsNullOrWhiteSpace(x.Key) && !x.Key.Equals("Default", StringComparison.OrdinalIgnoreCase))
+    .Where(x => x.Level is not null)
+    .ToArray();
 
 var logFilePath = Path.Combine(AppContext.BaseDirectory, "logs", "proxy-.log");
 var logDirectory = Path.GetDirectoryName(logFilePath);
@@ -27,11 +31,8 @@ if (!string.IsNullOrWhiteSpace(logDirectory))
     Directory.CreateDirectory(logDirectory);
 }
 
-Log.Logger = new LoggerConfiguration()
+var loggerConfiguration = new LoggerConfiguration()
     .MinimumLevel.Is(defaultLevel)
-    .MinimumLevel.Override("Microsoft", microsoftLevel)
-    .MinimumLevel.Override("Microsoft.AspNetCore", aspNetCoreLevel)
-    .MinimumLevel.Override("System", systemLevel)
     .Enrich.FromLogContext()
     .WriteTo.Console()
     .WriteTo.File(
@@ -39,8 +40,14 @@ Log.Logger = new LoggerConfiguration()
         rollingInterval: RollingInterval.Day,
         retainedFileCountLimit: 7,
         fileSizeLimitBytes: 10 * 1024 * 1024,
-        shared: true)
-    .CreateLogger();
+        shared: true);
+
+foreach (var (key, level) in overrideLevels)
+{
+    loggerConfiguration.MinimumLevel.Override(key, level!.Value);
+}
+
+Log.Logger = loggerConfiguration.CreateLogger();
 
 builder.Host.UseSerilog();
 
@@ -115,6 +122,7 @@ app.MapPost("/v1/messages", async (
     AzureOpenAiProxy proxy,
     NormalizedAzureOpenAiOptions azureOptions,
     ILogger<Program> logger,
+    ResponseLog responseLog,
     HttpResponse response,
     CancellationToken cancellationToken) =>
 {
@@ -128,6 +136,7 @@ app.MapPost("/v1/messages", async (
 
     request.OriginalModel ??= request.Model;
     request.ResolvedAzureModel = AnthropicConversion.ResolveAzureModel(request, azureOptions);
+    responseLog.LogRequest(request, isStream: request.Stream);
 
     logger.LogInformation("/v1/messages request start model {Model} resolved {ResolvedModel} stream={Stream} max_tokens={MaxTokens}",
         request.Model,
@@ -141,6 +150,7 @@ app.MapPost("/v1/messages", async (
         response.ContentType = "text/event-stream";
 
         var sseStats = new SseStreaming.StreamStats();
+        var sseEventIndex = 0;
 
         try
         {
@@ -148,8 +158,16 @@ app.MapPost("/v1/messages", async (
             await foreach (var sse in SseStreaming.HandleStreaming(stream, request, logger, sseStats)
                                .WithCancellation(cancellationToken))
             {
+                responseLog.LogAnthropicSseEvent(sseEventIndex, sse);
+                sseEventIndex++;
+
                 await response.WriteAsync(sse, cancellationToken);
                 await response.Body.FlushAsync(cancellationToken);
+            }
+
+            if (sseStats.AggregatedResponse is not null)
+            {
+                responseLog.LogAnthropicAggregatedResponse(sseStats.AggregatedResponse);
             }
 
             logger.LogInformation(
@@ -185,6 +203,7 @@ app.MapPost("/v1/messages", async (
     {
         var azureResponse = await proxy.SendAsync(request, cancellationToken);
         var anthropicResponse = AnthropicConversion.ConvertAzureToAnthropic(azureResponse, request, logger);
+        responseLog.LogAnthropicResponse(anthropicResponse);
         logger.LogInformation(
             "/v1/messages request completed elapsedMs={ElapsedMs} stopReason={StopReason} inputTokens={InputTokens} outputTokens={OutputTokens}",
             stopwatch.ElapsedMilliseconds,
