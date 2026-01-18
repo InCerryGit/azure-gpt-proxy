@@ -228,8 +228,15 @@ public static class CursorRequestAdapter
 
                     if (part.TryGetProperty("image_url", out var imageUrl))
                     {
-                        writer.WritePropertyName("image_url");
-                        imageUrl.WriteTo(writer);
+                        // OpenAI shape: image_url can be string or object {url, detail}
+                        if (imageUrl.ValueKind == JsonValueKind.String)
+                        {
+                            writer.WriteString("image_url", imageUrl.GetString());
+                        }
+                        else if (imageUrl.ValueKind == JsonValueKind.Object && imageUrl.TryGetProperty("url", out var urlValue))
+                        {
+                            writer.WriteString("image_url", urlValue.GetString());
+                        }
                     }
                     else if (part.TryGetProperty("image_base64", out var imageBase64))
                     {
@@ -238,8 +245,7 @@ public static class CursorRequestAdapter
                     }
                     else if (part.TryGetProperty("url", out var url))
                     {
-                        writer.WritePropertyName("image_url");
-                        url.WriteTo(writer);
+                        writer.WriteString("image_url", url.GetString());
                     }
 
                     writer.WriteEndObject();
