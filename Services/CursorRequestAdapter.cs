@@ -222,36 +222,13 @@ public static class CursorRequestAdapter
                     string.Equals(type, "input_image", StringComparison.OrdinalIgnoreCase) ||
                     string.Equals(type, "image", StringComparison.OrdinalIgnoreCase))
                 {
-                    // Responses API expects input_image with image_url or image_base64.
-                    writer.WriteStartObject();
-                    writer.WriteString("type", "input_image");
-
-                    if (part.TryGetProperty("image_url", out var imageUrl))
+                    // Responses API expects input_image with image_url (string URL or data URL) or image_base64.
+                    if (TryWriteInputImage(writer, part))
                     {
-                        // OpenAI shape: image_url can be string or object {url, detail}
-                        if (imageUrl.ValueKind == JsonValueKind.String)
-                        {
-                            var url = imageUrl.GetString();
-                            WriteImageUrl(writer, url);
-                        }
-                        else if (imageUrl.ValueKind == JsonValueKind.Object && imageUrl.TryGetProperty("url", out var urlValue))
-                        {
-                            var url = urlValue.GetString();
-                            WriteImageUrl(writer, url);
-                        }
-                    }
-                    else if (part.TryGetProperty("image_base64", out var imageBase64))
-                    {
-                        writer.WritePropertyName("image_base64");
-                        imageBase64.WriteTo(writer);
-                    }
-                    else if (part.TryGetProperty("url", out var url))
-                    {
-                        WriteImageUrl(writer, url.GetString());
+                        wrotePart = true;
                     }
 
-                    writer.WriteEndObject();
-                    wrotePart = true;
+                    continue;
                 }
             }
         }
@@ -277,6 +254,97 @@ public static class CursorRequestAdapter
         }
 
         writer.WriteString("image_url", url);
+    }
+
+    private static bool TryWriteInputImage(Utf8JsonWriter writer, JsonElement part)
+    {
+        // Ensure we never emit an empty input_image block.
+
+        var url = ExtractImageUrlString(part);
+        if (!string.IsNullOrWhiteSpace(url))
+        {
+            writer.WriteStartObject();
+            writer.WriteString("type", "input_image");
+            writer.WriteString("image_url", url);
+            writer.WriteEndObject();
+            return true;
+        }
+
+        if (part.TryGetProperty("image_base64", out var imageBase64))
+        {
+            if (imageBase64.ValueKind == JsonValueKind.String && string.IsNullOrWhiteSpace(imageBase64.GetString()))
+            {
+                return false;
+            }
+
+            writer.WriteStartObject();
+            writer.WriteString("type", "input_image");
+            writer.WritePropertyName("image_base64");
+            imageBase64.WriteTo(writer);
+            writer.WriteEndObject();
+            return true;
+        }
+
+        return false;
+    }
+
+    private static string? ExtractImageUrlString(JsonElement part)
+    {
+        // OpenAI shape: {"type":"image_url","image_url":"..."} or {"image_url":{"url":"...","detail":"..."}}
+        if (part.TryGetProperty("image_url", out var imageUrl))
+        {
+            if (imageUrl.ValueKind == JsonValueKind.String)
+            {
+                return imageUrl.GetString();
+            }
+
+            if (imageUrl.ValueKind == JsonValueKind.Object &&
+                imageUrl.TryGetProperty("url", out var urlValue) &&
+                urlValue.ValueKind == JsonValueKind.String)
+            {
+                return urlValue.GetString();
+            }
+        }
+
+        // Alternate shapes.
+        if (part.TryGetProperty("url", out var urlProp) && urlProp.ValueKind == JsonValueKind.String)
+        {
+            return urlProp.GetString();
+        }
+
+        // Claude/Anthropic style: {"type":"image","source":{"type":"url","url":"..."}} or base64.
+        if (part.TryGetProperty("source", out var source) && source.ValueKind == JsonValueKind.Object)
+        {
+            var sourceType = source.TryGetProperty("type", out var sourceTypeProp) && sourceTypeProp.ValueKind == JsonValueKind.String
+                ? sourceTypeProp.GetString()
+                : null;
+
+            if (string.Equals(sourceType, "url", StringComparison.OrdinalIgnoreCase) &&
+                source.TryGetProperty("url", out var srcUrl) &&
+                srcUrl.ValueKind == JsonValueKind.String)
+            {
+                return srcUrl.GetString();
+            }
+
+            if (string.Equals(sourceType, "base64", StringComparison.OrdinalIgnoreCase) &&
+                source.TryGetProperty("data", out var dataProp) &&
+                dataProp.ValueKind == JsonValueKind.String)
+            {
+                var base64 = dataProp.GetString();
+                if (string.IsNullOrWhiteSpace(base64))
+                {
+                    return null;
+                }
+
+                var mediaType = source.TryGetProperty("media_type", out var mediaTypeProp) && mediaTypeProp.ValueKind == JsonValueKind.String
+                    ? (mediaTypeProp.GetString() ?? "image/png")
+                    : "image/png";
+
+                return $"data:{mediaType};base64,{base64}";
+            }
+        }
+
+        return null;
     }
 
     private static string ExtractContentText(JsonElement content)
