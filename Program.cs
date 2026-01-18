@@ -179,11 +179,26 @@ static async Task<IResult> HandleCursorChatCompletions(
     using var responsesBody = built.responsesBody;
     var inboundModel = built.inboundModel;
 
+    // Cursor 兼容性问题排查：只在 Debug 级别输出最关键的上下文。
+    // 生产环境将 Logging:LogLevel:Default / Microsoft.AspNetCore 提高即可自动关闭。
+    if (logger.IsEnabled(LogLevel.Debug))
+    {
+        logger.LogDebug(
+            "cursor_request model={Model} messages={MessageCount} tools={ToolCount} tool_choice_present={HasToolChoice} user_present={HasUser}",
+            request.Model,
+            request.Messages?.Count ?? 0,
+            request.Tools?.Count ?? 0,
+            request.ToolChoice.HasValue && request.ToolChoice.Value.ValueKind is not JsonValueKind.Undefined and not JsonValueKind.Null,
+            !string.IsNullOrWhiteSpace(request.User));
+    }
+
     await using var azureStream = await proxy.SendStreamingAsync(responsesBody, cancellationToken);
     var adapter = new CursorResponseAdapter(inboundModel);
     var decoder = new SseDecoder();
 
     using var reader = new StreamReader(azureStream);
+    var debugSseCount = 0;
+    const int debugSseMax = 30; // 只打前 N 条，避免日志刷屏
     while (!cancellationToken.IsCancellationRequested)
     {
         var line = await reader.ReadLineAsync(cancellationToken);
@@ -196,6 +211,15 @@ static async Task<IResult> HandleCursorChatCompletions(
         {
             foreach (var sse in adapter.ConvertAzureSseDataToOpenAiSse(data))
             {
+                if (logger.IsEnabled(LogLevel.Debug) && debugSseCount < debugSseMax)
+                {
+                    // 记录下行 SSE（单行转义），用于诊断 Cursor "looping detected"。
+                    var singleLine = sse.Replace("\r", "\\r", StringComparison.Ordinal)
+                        .Replace("\n", "\\n", StringComparison.Ordinal);
+                    logger.LogDebug("cursor_downstream_sse[{Index}] {Sse}", debugSseCount, singleLine);
+                    debugSseCount++;
+                }
+
                 await response.WriteAsync(sse, cancellationToken);
                 await response.Body.FlushAsync(cancellationToken);
             }
@@ -205,6 +229,11 @@ static async Task<IResult> HandleCursorChatCompletions(
     // 兜底：确保以 [DONE] 结束（如果 Azure 没发 response.completed）
     await response.WriteAsync(OpenAiSseEncoder.Done(), cancellationToken);
     await response.Body.FlushAsync(cancellationToken);
+
+    if (logger.IsEnabled(LogLevel.Debug))
+    {
+        logger.LogDebug("cursor_downstream_sse_done wrote_done=true printed_first_n={N}", debugSseCount);
+    }
 
     logger.LogInformation("/cursor/chat/completions stream finished inboundModel={InboundModel}", inboundModel);
     return Results.Empty;
