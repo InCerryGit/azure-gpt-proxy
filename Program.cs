@@ -190,6 +190,20 @@ static async Task<IResult> HandleCursorChatCompletions(
             request.Tools?.Count ?? 0,
             request.ToolChoice.HasValue && request.ToolChoice.Value.ValueKind is not JsonValueKind.Undefined and not JsonValueKind.Null,
             !string.IsNullOrWhiteSpace(request.User));
+
+        if (request.Messages is { Count: > 0 })
+        {
+            for (var i = 0; i < request.Messages.Count; i++)
+            {
+                var msg = request.Messages[i];
+                logger.LogDebug(
+                    "cursor_request_message index={Index} role={Role} content_kind={ContentKind} content_summary={ContentSummary}",
+                    i,
+                    msg.Role,
+                    msg.Content.ValueKind.ToString(),
+                    SummarizeCursorContent(msg.Content));
+            }
+        }
     }
 
     await using var azureStream = await proxy.SendStreamingAsync(responsesBody, cancellationToken);
@@ -244,6 +258,86 @@ static async Task<IResult> HandleCursorChatCompletions(
 
     logger.LogInformation("/cursor/chat/completions stream finished inboundModel={InboundModel}", inboundModel);
     return Results.Empty;
+}
+
+static string SummarizeCursorContent(JsonElement content)
+{
+    const int maxLen = 200;
+
+    if (content.ValueKind == JsonValueKind.String)
+    {
+        var text = content.GetString() ?? string.Empty;
+        return text.Length <= maxLen ? text : text[..maxLen] + "...";
+    }
+
+    if (content.ValueKind == JsonValueKind.Array)
+    {
+        var parts = new List<string>();
+        foreach (var part in content.EnumerateArray())
+        {
+            if (part.ValueKind != JsonValueKind.Object)
+            {
+                parts.Add(part.ValueKind.ToString());
+                continue;
+            }
+
+            var type = part.TryGetProperty("type", out var typeProp) ? typeProp.GetString() : null;
+            if (string.Equals(type, "image_url", StringComparison.OrdinalIgnoreCase))
+            {
+                if (part.TryGetProperty("image_url", out var imageUrl))
+                {
+                    if (imageUrl.ValueKind == JsonValueKind.String)
+                    {
+                        parts.Add("image_url:string");
+                    }
+                    else if (imageUrl.ValueKind == JsonValueKind.Object && imageUrl.TryGetProperty("url", out _))
+                    {
+                        parts.Add("image_url:object(url)");
+                    }
+                    else
+                    {
+                        parts.Add("image_url:object");
+                    }
+                }
+                else
+                {
+                    parts.Add("image_url:missing");
+                }
+                continue;
+            }
+
+            if (string.Equals(type, "input_image", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(type, "image", StringComparison.OrdinalIgnoreCase))
+            {
+                if (part.TryGetProperty("image_base64", out var base64Prop) && base64Prop.ValueKind == JsonValueKind.String)
+                {
+                    parts.Add($"input_image:base64(len={base64Prop.GetString()?.Length ?? 0})");
+                }
+                else if (part.TryGetProperty("image_url", out var imageUrlProp))
+                {
+                    parts.Add($"input_image:image_url({imageUrlProp.ValueKind})");
+                }
+                else
+                {
+                    parts.Add("input_image:unknown");
+                }
+                continue;
+            }
+
+            if (!string.IsNullOrWhiteSpace(type))
+            {
+                parts.Add(type);
+            }
+            else
+            {
+                parts.Add("object");
+            }
+        }
+
+        return parts.Count == 0 ? "[]" : string.Join(",", parts);
+    }
+
+    return content.ValueKind.ToString();
 }
 
 
