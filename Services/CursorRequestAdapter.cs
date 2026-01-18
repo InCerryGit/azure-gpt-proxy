@@ -231,11 +231,13 @@ public static class CursorRequestAdapter
                         // OpenAI shape: image_url can be string or object {url, detail}
                         if (imageUrl.ValueKind == JsonValueKind.String)
                         {
-                            writer.WriteString("image_url", imageUrl.GetString());
+                            var url = imageUrl.GetString();
+                            WriteImageUrlOrBase64(writer, url);
                         }
                         else if (imageUrl.ValueKind == JsonValueKind.Object && imageUrl.TryGetProperty("url", out var urlValue))
                         {
-                            writer.WriteString("image_url", urlValue.GetString());
+                            var url = urlValue.GetString();
+                            WriteImageUrlOrBase64(writer, url);
                         }
                     }
                     else if (part.TryGetProperty("image_base64", out var imageBase64))
@@ -245,7 +247,7 @@ public static class CursorRequestAdapter
                     }
                     else if (part.TryGetProperty("url", out var url))
                     {
-                        writer.WriteString("image_url", url.GetString());
+                        WriteImageUrlOrBase64(writer, url.GetString());
                     }
 
                     writer.WriteEndObject();
@@ -265,6 +267,30 @@ public static class CursorRequestAdapter
         }
 
         writer.WriteEndArray();
+    }
+
+    private static void WriteImageUrlOrBase64(Utf8JsonWriter writer, string? url)
+    {
+        if (string.IsNullOrWhiteSpace(url))
+        {
+            return;
+        }
+
+        const string dataPrefix = "data:";
+        const string base64Marker = ";base64,";
+
+        if (url.StartsWith(dataPrefix, StringComparison.OrdinalIgnoreCase))
+        {
+            var idx = url.IndexOf(base64Marker, StringComparison.OrdinalIgnoreCase);
+            if (idx >= 0)
+            {
+                var base64 = url[(idx + base64Marker.Length)..];
+                writer.WriteString("image_base64", base64);
+                return;
+            }
+        }
+
+        writer.WriteString("image_url", url);
     }
 
     private static string ExtractContentText(JsonElement content)
