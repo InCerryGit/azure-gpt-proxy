@@ -130,7 +130,8 @@ public sealed class AzureOpenAiProxy
         if (isResponses)
         {
             var responseChunkIndex = 0;
-            await foreach (var chunk in StreamResponsesAsync(payload, cancellationToken))
+            var thinkingEnabled = request.Thinking is not null && request.Thinking.IsEnabled();
+            await foreach (var chunk in StreamResponsesAsync(payload, thinkingEnabled, cancellationToken))
             {
                 _responseLog.LogAzureStreamChunk(responseChunkIndex, chunk);
                 responseChunkIndex++;
@@ -252,6 +253,7 @@ public sealed class AzureOpenAiProxy
 
     private async IAsyncEnumerable<Dictionary<string, object?>> StreamResponsesAsync(
         Dictionary<string, object?> payload,
+        bool thinkingEnabled,
         [EnumeratorCancellation] CancellationToken cancellationToken)
     {
         var endpoint = _azureOptions.ResponsesEndpoint ?? _azureOptions.Endpoint;
@@ -335,8 +337,7 @@ public sealed class AzureOpenAiProxy
                     continue;
                 }
 
-                if (string.Equals(type, "response.output_text.delta", StringComparison.OrdinalIgnoreCase) ||
-                    string.Equals(type, "response.reasoning.summary_text.delta", StringComparison.OrdinalIgnoreCase))
+                if (string.Equals(type, "response.output_text.delta", StringComparison.OrdinalIgnoreCase))
                 {
                     var delta = root.TryGetProperty("delta", out var deltaProp)
                         ? deltaProp.GetString() ?? string.Empty
@@ -344,6 +345,18 @@ public sealed class AzureOpenAiProxy
                     if (!string.IsNullOrEmpty(delta))
                     {
                         yield return BuildStreamingChunk(content: delta, toolCalls: null, finishReason: null, usage: null);
+                    }
+                    continue;
+                }
+
+                if (string.Equals(type, "response.reasoning.summary_text.delta", StringComparison.OrdinalIgnoreCase))
+                {
+                    var delta = root.TryGetProperty("delta", out var deltaProp)
+                        ? deltaProp.GetString() ?? string.Empty
+                        : string.Empty;
+                    if (!string.IsNullOrEmpty(delta) && thinkingEnabled)
+                    {
+                        yield return BuildStreamingChunk(content: null, thinkingDelta: delta, toolCalls: null, finishReason: null, usage: null);
                     }
                     continue;
                 }
@@ -1103,6 +1116,7 @@ public sealed class AzureOpenAiProxy
 
     private static Dictionary<string, object?> BuildStreamingChunk(
         string? content,
+        string? thinkingDelta,
         object? toolCalls,
         string? finishReason,
         Dictionary<string, object?>? usage)
@@ -1111,6 +1125,11 @@ public sealed class AzureOpenAiProxy
         if (content is not null)
         {
             delta["content"] = content;
+        }
+
+        if (thinkingDelta is not null)
+        {
+            delta["thinking_delta"] = thinkingDelta;
         }
 
         if (toolCalls is not null)
@@ -1136,6 +1155,15 @@ public sealed class AzureOpenAiProxy
         }
 
         return chunk;
+    }
+
+    private static Dictionary<string, object?> BuildStreamingChunk(
+        string? content,
+        object? toolCalls,
+        string? finishReason,
+        Dictionary<string, object?>? usage)
+    {
+        return BuildStreamingChunk(content, thinkingDelta: null, toolCalls, finishReason, usage);
     }
 
     private void LogResponsesRequest(Dictionary<string, object?> requestPayload, string endpoint)

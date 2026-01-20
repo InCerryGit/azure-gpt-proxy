@@ -42,8 +42,9 @@ public static class SseStreaming
     private static MessagesResponse BuildAggregatedResponse(
         string messageId,
         string responseModel,
+        bool includeThinking,
+        string accumulatedThinking,
         string accumulatedText,
-        Dictionary<string, int> toolKeyToAnthropicIndex,
         Dictionary<int, ToolUseAggregate> toolAggregates,
         int inputTokens,
         int outputTokens,
@@ -53,39 +54,33 @@ public static class SseStreaming
     {
         var content = new List<Dictionary<string, object?>>();
 
-        // text block index=0 is always present in this implementation
+        if (includeThinking && !string.IsNullOrWhiteSpace(accumulatedThinking))
+        {
+            content.Add(new Dictionary<string, object?>
+            {
+                ["type"] = "thinking",
+                ["thinking"] = accumulatedThinking,
+                ["signature"] = string.Empty
+            });
+        }
+
         content.Add(new Dictionary<string, object?>
         {
             ["type"] = "text",
             ["text"] = accumulatedText
         });
 
-        // We can determine how many tool blocks were started by taking the max mapped index.
-        // Tool content blocks are 1..N.
-        var maxToolIndex = toolKeyToAnthropicIndex.Count == 0 ? 0 : toolKeyToAnthropicIndex.Values.Max();
-        for (var i = 1; i <= maxToolIndex; i++)
+        foreach (var toolIndex in toolAggregates.Keys.OrderBy(x => x))
         {
-            if (toolAggregates.TryGetValue(i, out var aggregate))
+            var aggregate = toolAggregates[toolIndex];
+            var input = ParseToolInputJson(aggregate.Arguments.ToString());
+            content.Add(new Dictionary<string, object?>
             {
-                var input = ParseToolInputJson(aggregate.Arguments.ToString());
-                content.Add(new Dictionary<string, object?>
-                {
-                    ["type"] = "tool_use",
-                    ["id"] = aggregate.Id,
-                    ["name"] = aggregate.Name,
-                    ["input"] = input
-                });
-            }
-            else
-            {
-                content.Add(new Dictionary<string, object?>
-                {
-                    ["type"] = "tool_use",
-                    ["id"] = string.Empty,
-                    ["name"] = string.Empty,
-                    ["input"] = new Dictionary<string, object?>()
-                });
-            }
+                ["type"] = "tool_use",
+                ["id"] = aggregate.Id,
+                ["name"] = aggregate.Name,
+                ["input"] = input
+            });
         }
 
         return new MessagesResponse
@@ -226,54 +221,50 @@ public static class SseStreaming
 
         // Per-stream mapping: OpenAI tool call (id preferred, else index) -> Anthropic content block index.
         // This must be per request; any shared/static map will break concurrent streams.
+        var thinkingEnabled = originalRequest.Thinking is not null && originalRequest.Thinking.IsEnabled();
+
+        // Per-stream mapping: OpenAI tool call (id preferred, else index) -> Anthropic content block index.
+        // We reserve index=0 for thinking (if enabled & present) and index=1 for text (when thinking exists).
+        // So the first tool block index must start at 1 (no thinking) or 2 (with thinking).
         var toolKeyToAnthropicIndex = new Dictionary<string, int>(StringComparer.Ordinal);
         var toolAggregates = new Dictionary<int, ToolUseAggregate>();
         var unknownToolKeySeq = 0;
         int? toolIndex = null;
         var accumulatedText = string.Empty;
+        var accumulatedThinking = string.Empty;
         var textSent = false;
         var textBlockClosed = false;
+        var thinkingSent = false;
+        var thinkingBlockClosed = false;
         var inputTokens = 0;
         var outputTokens = 0;
         var cacheReadInputTokens = 0;
         var cacheCreationInputTokens = 0;
         var hasSentStopReason = false;
-        var lastToolIndex = 0;
+        var lastToolIndex = thinkingEnabled ? 1 : 0;
 
         if (!await enumerator.MoveNextAsync())
         {
             yield return EmitMessageStart(messageId, responseModel, 0, 0, 0, 0);
-            yield return EmitContentBlockStart(0, new { type = "text", text = string.Empty });
             yield return EmitEvent("ping", new { type = "ping" });
             yield return EmitMessageDelta("end_turn", 0, 0, 0, 0);
             yield return EmitMessageStop();
             yield return "data: [DONE]\n\n";
 
-            stats.EventCount += 6;
+            stats.EventCount += 5;
             stats.StopReason = "end_turn";
-            stats.AggregatedResponse = new MessagesResponse
-            {
-                Id = messageId,
-                Model = responseModel,
-                Role = "assistant",
-                Content = new List<Dictionary<string, object?>>
-                {
-                    new()
-                    {
-                        ["type"] = "text",
-                        ["text"] = string.Empty
-                    }
-                },
-                StopReason = "end_turn",
-                StopSequence = null,
-                Usage = new Usage
-                {
-                    InputTokens = 0,
-                    OutputTokens = 0,
-                    CacheCreationInputTokens = 0,
-                    CacheReadInputTokens = 0
-                }
-            };
+            stats.AggregatedResponse = BuildAggregatedResponse(
+                messageId,
+                responseModel,
+                includeThinking: false,
+                accumulatedThinking: string.Empty,
+                accumulatedText: string.Empty,
+                toolAggregates: new Dictionary<int, ToolUseAggregate>(),
+                inputTokens: 0,
+                outputTokens: 0,
+                cacheReadInputTokens: 0,
+                cacheCreationInputTokens: 0,
+                stopReason: "end_turn");
             logger.LogInformation(
                 "Streaming ended without chunks messageId={MessageId} chunks=0 events={EventCount}",
                 messageId,
@@ -291,10 +282,9 @@ public static class SseStreaming
             outputTokens,
             cacheReadInputTokens,
             cacheCreationInputTokens);
-        yield return EmitContentBlockStart(0, new { type = "text", text = string.Empty });
         yield return EmitEvent("ping", new { type = "ping" });
 
-        stats.EventCount += 3;
+        stats.EventCount += 2;
 
         // Process the first chunk we already pulled, then continue with the remaining stream.
         foreach (var chunk in new[] { firstChunk })
@@ -309,6 +299,10 @@ public static class SseStreaming
                     responseModel,
                     chunk,
                     ref toolIndex,
+                    thinkingEnabled,
+                    ref accumulatedThinking,
+                    ref thinkingSent,
+                    ref thinkingBlockClosed,
                     ref accumulatedText,
                     ref textSent,
                     ref textBlockClosed,
@@ -362,6 +356,10 @@ public static class SseStreaming
                     responseModel,
                     chunk,
                     ref toolIndex,
+                    thinkingEnabled,
+                    ref accumulatedThinking,
+                    ref thinkingSent,
+                    ref thinkingBlockClosed,
                     ref accumulatedText,
                     ref textSent,
                     ref textBlockClosed,
@@ -404,7 +402,15 @@ public static class SseStreaming
 
         if (!hasSentStopReason)
         {
-            var remainingEvents = CloseOpenBlocks(toolIndex, lastToolIndex, textBlockClosed, accumulatedText, textSent).ToList();
+            if (thinkingSent && !thinkingBlockClosed)
+            {
+                thinkingBlockClosed = true;
+                yield return EmitContentBlockStop(0);
+                stats.EventCount += 1;
+            }
+
+            var textIndex = thinkingSent ? 1 : 0;
+            var remainingEvents = CloseOpenBlocks(toolIndex, lastToolIndex, textBlockClosed, textIndex, accumulatedText, textSent).ToList();
             foreach (var evt in remainingEvents)
             {
                 yield return evt;
@@ -422,8 +428,9 @@ public static class SseStreaming
             stats.AggregatedResponse = BuildAggregatedResponse(
                 messageId,
                 responseModel,
+                includeThinking: thinkingEnabled,
+                accumulatedThinking,
                 accumulatedText,
-                toolKeyToAnthropicIndex,
                 toolAggregates,
                 inputTokens,
                 outputTokens,
@@ -481,17 +488,27 @@ public static class SseStreaming
             }
 
             var blockType = typeObj?.ToString();
-            if (blockType == "text")
-            {
-                var text = block.TryGetValue("text", out var textObj) ? textObj?.ToString() ?? string.Empty : string.Empty;
-                yield return EmitContentBlockStart(blockIndex, new { type = "text", text = string.Empty });
-                if (!string.IsNullOrEmpty(text))
-                {
-                    yield return EmitContentBlockDelta(blockIndex, new { type = "text_delta", text });
-                }
-                yield return EmitContentBlockStop(blockIndex);
-            }
-            else if (blockType == "tool_use")
+             if (blockType == "text")
+             {
+                 var text = block.TryGetValue("text", out var textObj) ? textObj?.ToString() ?? string.Empty : string.Empty;
+                 yield return EmitContentBlockStart(blockIndex, new { type = "text", text = string.Empty });
+                 if (!string.IsNullOrEmpty(text))
+                 {
+                     yield return EmitContentBlockDelta(blockIndex, new { type = "text_delta", text });
+                 }
+                 yield return EmitContentBlockStop(blockIndex);
+             }
+             else if (blockType == "thinking")
+             {
+                 var thinking = block.TryGetValue("thinking", out var thinkingObj) ? thinkingObj?.ToString() ?? string.Empty : string.Empty;
+                 yield return EmitContentBlockStart(blockIndex, new { type = "thinking", thinking = string.Empty });
+                 if (!string.IsNullOrEmpty(thinking))
+                 {
+                     yield return EmitContentBlockDelta(blockIndex, new { type = "thinking_delta", thinking });
+                 }
+                 yield return EmitContentBlockStop(blockIndex);
+             }
+             else if (blockType == "tool_use")
             {
                 yield return EmitContentBlockStart(blockIndex, block);
                 yield return EmitContentBlockStop(blockIndex);
@@ -672,23 +689,41 @@ public static class SseStreaming
         return null;
     }
 
-    private static object? ExtractDeltaToolCalls(object delta)
-    {
-        if (delta is JsonElement element && element.ValueKind == JsonValueKind.Object)
-        {
-            if (element.TryGetProperty("tool_calls", out var toolProp))
-            {
-                return toolProp;
-            }
-        }
+     private static object? ExtractDeltaToolCalls(object delta)
+     {
+         if (delta is JsonElement element && element.ValueKind == JsonValueKind.Object)
+         {
+             if (element.TryGetProperty("tool_calls", out var toolProp))
+             {
+                 return toolProp;
+             }
+         }
 
-        if (delta is IDictionary<string, object?> dict && dict.TryGetValue("tool_calls", out var toolObj))
-        {
-            return toolObj;
-        }
+         if (delta is IDictionary<string, object?> dict && dict.TryGetValue("tool_calls", out var toolObj))
+         {
+             return toolObj;
+         }
 
-        return null;
-    }
+         return null;
+     }
+
+     private static string? ExtractDeltaThinkingDelta(object delta)
+     {
+         if (delta is JsonElement element && element.ValueKind == JsonValueKind.Object)
+         {
+             if (element.TryGetProperty("thinking_delta", out var thinkingProp) && thinkingProp.ValueKind == JsonValueKind.String)
+             {
+                 return thinkingProp.GetString();
+             }
+         }
+
+         if (delta is IDictionary<string, object?> dict && dict.TryGetValue("thinking_delta", out var thinkingObj))
+         {
+             return thinkingObj?.ToString();
+         }
+
+         return null;
+     }
 
     private static IEnumerable<object> EnumerateJsonArray(JsonElement element)
     {
@@ -703,6 +738,10 @@ public static class SseStreaming
         string responseModel,
         Dictionary<string, object?> chunk,
         ref int? toolIndex,
+        bool thinkingEnabled,
+        ref string accumulatedThinking,
+        ref bool thinkingSent,
+        ref bool thinkingBlockClosed,
         ref string accumulatedText,
         ref bool textSent,
         ref bool textBlockClosed,
@@ -729,26 +768,72 @@ public static class SseStreaming
             return events;
         }
 
+        var deltaThinking = ExtractDeltaThinkingDelta(delta);
         var deltaContent = ExtractDeltaContent(delta);
         var deltaToolCalls = ExtractDeltaToolCalls(delta);
 
+        if (!string.IsNullOrEmpty(deltaThinking) && thinkingEnabled)
+        {
+            if (!thinkingSent)
+            {
+                thinkingSent = true;
+                lastToolIndex = Math.Max(lastToolIndex, 1);
+                events.Add(EmitContentBlockStart(0, new { type = "thinking", thinking = string.Empty }));
+            }
+
+            if (!thinkingSent)
+            {
+                lastToolIndex = Math.Max(lastToolIndex, 1);
+            }
+
+            accumulatedThinking += deltaThinking;
+            events.Add(EmitContentBlockDelta(0, new { type = "thinking_delta", thinking = deltaThinking }));
+        }
+
         if (!string.IsNullOrEmpty(deltaContent))
         {
+            if (thinkingSent && !thinkingBlockClosed)
+            {
+                thinkingBlockClosed = true;
+                events.Add(EmitContentBlockStop(0));
+            }
+
+            if (!textSent)
+            {
+                var textIndex = thinkingSent ? 1 : 0;
+                textSent = true;
+
+                if (thinkingSent)
+                {
+                    // Ensure tool indices start after thinking/text.
+                    lastToolIndex = Math.Max(lastToolIndex, 1);
+                }
+
+                events.Add(EmitContentBlockStart(textIndex, new { type = "text", text = string.Empty }));
+            }
+
             accumulatedText += deltaContent;
             stats.OutputCharacters = accumulatedText.Length;
+
+            var deltaIndex = thinkingSent ? 1 : 0;
             if (toolIndex is null && !textBlockClosed)
             {
-                textSent = true;
-                events.Add(EmitContentBlockDelta(0, new { type = "text_delta", text = deltaContent }));
+                events.Add(EmitContentBlockDelta(deltaIndex, new { type = "text_delta", text = deltaContent }));
             }
         }
 
         if (deltaToolCalls is not null)
         {
+            if (thinkingSent && !thinkingBlockClosed)
+            {
+                thinkingBlockClosed = true;
+                events.Add(EmitContentBlockStop(0));
+            }
+
             if (toolIndex is null)
             {
-                foreach (var evt in CloseTextBlockIfNeeded(
-                             toolIndex, textBlockClosed, accumulatedText, textSent))
+                var textIndex = thinkingSent ? 1 : 0;
+                foreach (var evt in CloseTextBlockIfNeeded(toolIndex, textBlockClosed, textIndex, accumulatedText, textSent))
                 {
                     if (evt is not null)
                     {
@@ -768,7 +853,13 @@ public static class SseStreaming
             foreach (var toolCall in toolCalls)
             {
                 var (newToolIndex, newLastToolIndex, createdEvents) = HandleToolDelta(
-                    toolCall, toolIndex, lastToolIndex, toolKeyToAnthropicIndex, toolAggregates, ref unknownToolKeySeq);
+                    toolCall,
+                    toolIndex,
+                    lastToolIndex,
+                    toolKeyToAnthropicIndex,
+                    toolAggregates,
+                    ref unknownToolKeySeq,
+                    thinkingSent);
                 toolIndex = newToolIndex;
                 lastToolIndex = newLastToolIndex;
                 events.AddRange(createdEvents);
@@ -778,15 +869,23 @@ public static class SseStreaming
         if (!string.IsNullOrWhiteSpace(finishReason) && !hasSentStopReason)
         {
             hasSentStopReason = true;
-            events.AddRange(CloseOpenBlocks(toolIndex, lastToolIndex, textBlockClosed, accumulatedText, textSent));
+            if (thinkingSent && !thinkingBlockClosed)
+            {
+                thinkingBlockClosed = true;
+                events.Add(EmitContentBlockStop(0));
+            }
+
+            var textIndex = thinkingSent ? 1 : 0;
+            events.AddRange(CloseOpenBlocks(toolIndex, lastToolIndex, textBlockClosed, textIndex, accumulatedText, textSent));
 
             var stopReason = MapStopReason(finishReason);
             stats.StopReason = stopReason;
             stats.AggregatedResponse = BuildAggregatedResponse(
                 messageId,
                 responseModel,
+                includeThinking: thinkingEnabled,
+                accumulatedThinking,
                 accumulatedText,
-                toolKeyToAnthropicIndex,
                 toolAggregates,
                 inputTokens,
                 outputTokens,
@@ -805,6 +904,7 @@ public static class SseStreaming
         int? toolIndex,
         int lastToolIndex,
         bool textBlockClosed,
+        int textIndex,
         string accumulatedText,
         bool textSent)
     {
@@ -820,16 +920,17 @@ public static class SseStreaming
         {
             if (!string.IsNullOrEmpty(accumulatedText) && !textSent)
             {
-                yield return EmitContentBlockDelta(0, new { type = "text_delta", text = accumulatedText });
+                yield return EmitContentBlockDelta(textIndex, new { type = "text_delta", text = accumulatedText });
             }
 
-            yield return EmitContentBlockStop(0);
+            yield return EmitContentBlockStop(textIndex);
         }
     }
 
     private static IEnumerable<string?> CloseTextBlockIfNeeded(
         int? toolIndex,
         bool textBlockClosed,
+        int textIndex,
         string accumulatedText,
         bool textSent)
     {
@@ -837,16 +938,16 @@ public static class SseStreaming
         {
             if (textSent)
             {
-                yield return EmitContentBlockStop(0);
+                yield return EmitContentBlockStop(textIndex);
             }
             else if (!string.IsNullOrEmpty(accumulatedText))
             {
-                yield return EmitContentBlockDelta(0, new { type = "text_delta", text = accumulatedText });
-                yield return EmitContentBlockStop(0);
+                yield return EmitContentBlockDelta(textIndex, new { type = "text_delta", text = accumulatedText });
+                yield return EmitContentBlockStop(textIndex);
             }
             else
             {
-                yield return EmitContentBlockStop(0);
+                yield return EmitContentBlockStop(textIndex);
             }
         }
 
@@ -859,7 +960,8 @@ public static class SseStreaming
         int lastToolIndex,
         Dictionary<string, int> toolKeyToAnthropicIndex,
         Dictionary<int, ToolUseAggregate> toolAggregates,
-        ref int unknownToolKeySeq)
+        ref int unknownToolKeySeq,
+        bool thinkingSent)
     {
         var toolId = ExtractString(toolCall, "id");
 
@@ -921,7 +1023,13 @@ public static class SseStreaming
         }
 
         toolIndex = 0;
-        lastToolIndex += 1;
+
+        // Reserve content block indices:
+        // - index 0: thinking (optional)
+        // - index 0 or 1: text (depending on whether thinking exists)
+        // So the first tool index is 1 (no thinking) or 2 (with thinking).
+        var minToolIndex = thinkingSent ? 2 : 1;
+        lastToolIndex = Math.Max(lastToolIndex + 1, minToolIndex);
         var anthropicToolIndex = lastToolIndex;
         toolKeyToAnthropicIndex[toolKey] = anthropicToolIndex;
 
